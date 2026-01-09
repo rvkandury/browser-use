@@ -1374,7 +1374,7 @@ class BrowserSession(BaseModel):
 		# self.event_bus.on(BrowserStoppedEvent, self._crash_watchdog.on_BrowserStoppedEvent)
 		# self._crash_watchdog.attach_to_session()
 
-		# Initialize DownloadsWatchdog
+		# Initialize DownloadsWatchdog (always enabled - handles both local and remote downloads)
 		DownloadsWatchdog.model_rebuild()
 		self._downloads_watchdog = DownloadsWatchdog(event_bus=self.event_bus, browser_session=self)
 		# self.event_bus.on(BrowserLaunchEvent, self._downloads_watchdog.on_BrowserLaunchEvent)
@@ -1385,6 +1385,8 @@ class BrowserSession(BaseModel):
 		self._downloads_watchdog.attach_to_session()
 		if self.browser_profile.auto_download_pdfs:
 			self.logger.debug('📄 PDF auto-download enabled for this session')
+		if self.browser_profile.remote_downloads:
+			self.logger.info('📡 Remote downloads enabled - using HTTP client for downloads')
 
 		# Initialize StorageStateWatchdog conditionally
 		# Enable when user provides either storage_state or user_data_dir (indicating they want persistence)
@@ -3543,3 +3545,66 @@ class BrowserSession(BaseModel):
 			'width': max(content[0], content[2], content[4], content[6]) - min(content[0], content[2], content[4], content[6]),
 			'height': max(content[1], content[3], content[5], content[7]) - min(content[1], content[3], content[5], content[7]),
 		}
+
+	async def _download_via_http(self, url: str):
+		"""Download file directly via HTTP client with browser session data."""
+		try:
+			self.logger.info(f"🌐 Direct HTTP download: {url[:100]}...")
+			
+			# Extract cookies from browser session
+			cookies = {}
+			try:
+				if hasattr(self, '_storage_state_watchdog') and self._storage_state_watchdog:
+					cookies_list = await self._storage_state_watchdog.get_current_cookies()
+					cookies = {cookie['name']: cookie['value'] for cookie in cookies_list}
+					self.logger.debug(f"🍪 Using {len(cookies)} cookies for authenticated download")
+				else:
+					# Fallback to direct CDP cookie extraction
+					cookies_list = await self._cdp_get_cookies()
+					cookies = {cookie['name']: cookie['value'] for cookie in cookies_list}
+					self.logger.debug(f"🍪 Using {len(cookies)} cookies via CDP for download")
+			except Exception as e:
+				self.logger.debug(f"⚠️ Could not extract cookies: {e}")
+			
+			# Get headers from browser profile
+			headers = (self.browser_profile.headers or {}).copy()
+			if not headers.get('User-Agent'):
+				headers['User-Agent'] = 'Mozilla/5.0 (compatible; browser-use)'
+
+			async with httpx.AsyncClient(
+				timeout=300,
+				cookies=cookies,
+				headers=headers
+			) as client:
+				async with client.stream('GET', url) as response:
+					response.raise_for_status()
+					
+					local_downloads_dir = Path("./downloads")
+					local_downloads_dir.mkdir(exist_ok=True)
+					
+					filename = url.split('/')[-1].split('?')[0] or 'download.dat'
+					local_path = local_downloads_dir / filename
+					
+					with open(local_path, 'wb') as f:
+						async for chunk in response.aiter_bytes():
+							f.write(chunk)
+					
+					file_size = local_path.stat().st_size
+					self.logger.info(f"✅ HTTP download complete: {file_size} bytes saved to {local_path}")
+					
+					# Emit FileDownloadedEvent to integrate with existing download tracking
+					self.event_bus.dispatch(
+						FileDownloadedEvent(
+							url=url,
+							path=str(local_path),
+							file_name=filename,
+							file_size=file_size,
+							file_type=filename.split('.')[-1] if '.' in filename else None,
+							mime_type=response.headers.get('content-type'),
+							auto_download=False,
+							from_cache=False
+						)
+					)
+					
+		except Exception as e:
+			self.logger.error(f"❌ HTTP download failed: {e}")
