@@ -299,6 +299,8 @@ class MessageManager:
 		sensitive_data=None,
 		available_file_paths: list[str] | None = None,  # Always pass current available_file_paths
 		unavailable_skills_info: str | None = None,  # Information about skills that cannot be used yet
+		active_downloads: list[dict] | None = None,
+		failed_downloads: list[dict] | None = None,
 	) -> None:
 		"""Create single state message with all content"""
 
@@ -366,6 +368,8 @@ class MessageManager:
 			read_state_images=self.state.read_state_images,
 			llm_screenshot_size=self.llm_screenshot_size,
 			unavailable_skills_info=unavailable_skills_info,
+			active_downloads=active_downloads,
+			failed_downloads=failed_downloads,
 		).get_user_message(effective_use_vision)
 
 		# Store state message text for history

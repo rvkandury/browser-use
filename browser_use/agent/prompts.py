@@ -105,6 +105,8 @@ class AgentMessagePrompt:
 		read_state_images: list[dict] | None = None,
 		llm_screenshot_size: tuple[int, int] | None = None,
 		unavailable_skills_info: str | None = None,
+		active_downloads: list[dict] | None = None,
+		failed_downloads: list[dict] | None = None,
 	):
 		self.browser_state: 'BrowserStateSummary' = browser_state_summary
 		self.file_system: 'FileSystem | None' = file_system
@@ -123,6 +125,8 @@ class AgentMessagePrompt:
 		self.sample_images = sample_images or []
 		self.read_state_images = read_state_images or []
 		self.unavailable_skills_info: str | None = unavailable_skills_info
+		self.active_downloads: list[dict] | None = active_downloads
+		self.failed_downloads: list[dict] | None = failed_downloads
 		self.llm_screenshot_size = llm_screenshot_size
 		assert self.browser_state
 
@@ -333,6 +337,19 @@ Available tabs:
 		if self.available_file_paths:
 			available_file_paths_text = '\n'.join(self.available_file_paths)
 			agent_state += f'<available_file_paths>{available_file_paths_text}\nUse with absolute paths</available_file_paths>\n'
+		
+		# Add download context
+		if self.active_downloads:
+			downloads_text = '\n'.join([
+				f"Downloading: {d['filename']} ({d.get('progress', f\"{d['duration']}s elapsed\")})"
+				for d in self.active_downloads
+			])
+			agent_state += f'<downloads_in_progress>{downloads_text}\nThese files are downloading in background</downloads_in_progress>\n'
+		
+		if self.failed_downloads:
+			failures_text = '\n'.join([f"Failed: {f['filename']} ({f['error']}) {f['age_minutes']}m ago" for f in self.failed_downloads])
+			agent_state += f'<failed_downloads>{failures_text}\nThese downloads failed recently</failed_downloads>\n'
+		
 		return agent_state
 
 	def _resize_screenshot(self, screenshot_b64: str) -> str:

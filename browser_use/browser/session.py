@@ -415,6 +415,8 @@ class BrowserSession(BaseModel):
 	# Mutable private state shared between watchdogs
 	_cdp_client_root: CDPClient | None = PrivateAttr(default=None)
 	_connection_lock: Any = PrivateAttr(default=None)  # asyncio.Lock for preventing concurrent connections
+	_active_downloads: dict[str, dict] = PrivateAttr(default_factory=dict)  # url -> {filename, start_time}
+	_failed_downloads: list[dict] = PrivateAttr(default_factory=list)  # Track failed downloads
 
 	# PUBLIC: SessionManager instance (OWNS all targets and sessions)
 	session_manager: Any = Field(default=None, exclude=True)  # SessionManager
@@ -3543,3 +3545,166 @@ class BrowserSession(BaseModel):
 			'width': max(content[0], content[2], content[4], content[6]) - min(content[0], content[2], content[4], content[6]),
 			'height': max(content[1], content[3], content[5], content[7]) - min(content[1], content[3], content[5], content[7]),
 		}
+
+	async def _download_via_http(self, url: str):
+		"""Download file directly via HTTP client with browser session data."""
+		try:
+			self.logger.info(f"🌐 Direct HTTP download: {url[:100]}...")
+			
+			# Extract cookies from browser session
+			cookies = {}
+			try:
+				if hasattr(self, '_storage_state_watchdog') and self._storage_state_watchdog:
+					cookies_list = await self._storage_state_watchdog.get_current_cookies()
+					cookies = {cookie['name']: cookie['value'] for cookie in cookies_list}
+					self.logger.debug(f"🍪 Using {len(cookies)} cookies for authenticated download")
+				else:
+					# Fallback to direct CDP cookie extraction
+					cookies_list = await self._cdp_get_cookies()
+					cookies = {cookie['name']: cookie['value'] for cookie in cookies_list}
+					self.logger.debug(f"🍪 Using {len(cookies)} cookies via CDP for download")
+			except Exception as e:
+				self.logger.debug(f"⚠️ Could not extract cookies: {e}")
+			
+			# Get headers from browser profile
+			headers = (self.browser_profile.headers or {}).copy()
+			if not headers.get('User-Agent'):
+				headers['User-Agent'] = 'Mozilla/5.0 (compatible; browser-use)'
+
+			async with httpx.AsyncClient(
+				timeout=300,
+				cookies=cookies,
+				headers=headers
+			) as client:
+				async with client.stream('GET', url) as response:
+					response.raise_for_status()
+					
+					local_downloads_dir = Path("./downloads")
+					local_downloads_dir.mkdir(exist_ok=True)
+					
+					filename = url.split('/')[-1].split('?')[0] or 'download.dat'
+					local_path = local_downloads_dir / filename
+					
+					# Get total size from headers for progress tracking
+					total_size = int(response.headers.get('content-length', 0))
+					downloaded = 0
+					
+					with open(local_path, 'wb') as f:
+						async for chunk in response.aiter_bytes():
+							f.write(chunk)
+							
+							# Track progress
+							downloaded += len(chunk)
+							if url in self._active_downloads:
+								self._active_downloads[url]['downloaded'] = downloaded
+								self._active_downloads[url]['total_size'] = total_size
+					
+					file_size = local_path.stat().st_size
+					self.logger.info(f"✅ HTTP download complete: {file_size} bytes saved to {local_path}")
+					
+					# Emit FileDownloadedEvent to integrate with existing download tracking
+					self.event_bus.dispatch(
+						FileDownloadedEvent(
+							url=url,
+							path=str(local_path),
+							file_name=filename,
+							file_size=file_size,
+							file_type=filename.split('.')[-1] if '.' in filename else None,
+							mime_type=response.headers.get('content-type'),
+							auto_download=False,
+							from_cache=False
+						)
+					)
+					
+		except Exception as e:
+			self.logger.error(f"❌ HTTP download failed: {e}")
+			
+			# Track the failed download
+			filename = url.split('/')[-1].split('?')[0] or 'download.dat'
+			self.add_failed_download(url, filename, str(e))
+			
+			# Remove from active downloads
+			self.remove_active_download(url)
+
+	def get_active_downloads(self) -> list[dict]:
+		"""Get list of currently active downloads, cleaning up old ones."""
+		import time
+		current_time = time.time()
+		
+		# Clean up downloads older than 10 minutes (assume failed)
+		expired_urls = [
+			url for url, info in self._active_downloads.items() 
+			if current_time - info['start_time'] > 600  # 10 minutes
+		]
+		for url in expired_urls:
+			filename = self._active_downloads[url]['filename']
+			self._active_downloads.pop(url, None)
+			self.logger.info(f"⏰ Cleaned up 1 expired download: {filename} (total: {len(self._active_downloads)} active downloads)")
+		
+		# Return remaining active downloads with progress
+		active = []
+		for url, info in self._active_downloads.items():
+			download_info = {
+				'url': url,
+				'filename': info['filename'],
+				'duration': int(current_time - info['start_time'])
+			}
+			
+			# Add progress information if available
+			if 'downloaded' in info and 'total_size' in info:
+				downloaded = info['downloaded']
+				total_size = info['total_size']
+				if total_size > 0:
+					progress_percent = int((downloaded / total_size) * 100)
+					downloaded_mb = downloaded / (1024 * 1024)
+					total_mb = total_size / (1024 * 1024)
+					download_info['progress'] = f"{downloaded_mb:.1f}MB / {total_mb:.1f}MB ({progress_percent}%)"
+				else:
+					downloaded_mb = downloaded / (1024 * 1024)
+					download_info['progress'] = f"{downloaded_mb:.1f}MB"
+			
+			active.append(download_info)
+		return active
+
+	def add_active_download(self, url: str, filename: str):
+		"""Track a new active download."""
+		import time
+		self._active_downloads[url] = {
+			'filename': filename,
+			'start_time': time.time()
+		}
+		self.logger.info(f"📥 Added 1 active download: {filename} (total: {len(self._active_downloads)} active downloads)")
+
+	def remove_active_download(self, url: str):
+		"""Remove completed download from tracking."""
+		if url in self._active_downloads:
+			filename = self._active_downloads[url]['filename']
+			self._active_downloads.pop(url, None)
+			self.logger.info(f"✅ Removed 1 active download: {filename} (total: {len(self._active_downloads)} active downloads)")
+
+	def add_failed_download(self, url: str, filename: str, error: str):
+		"""Track a failed download."""
+		import time
+		self._failed_downloads.append({
+			'url': url,
+			'filename': filename,
+			'error': str(error),
+			'timestamp': time.time()
+		})
+		self.logger.info(f"❌ Added 1 failed download: {filename} (total: {len(self._failed_downloads)} failed downloads)")
+		self.logger.error(f"❌ Download failed: {filename} - {error}")
+
+	def get_failed_downloads(self) -> list[dict]:
+		"""Get list of recent failed downloads (last 5 minutes)."""
+		import time
+		cutoff = time.time() - 300  # 5 minutes
+		recent_failures = []
+		for failure in self._failed_downloads:
+			if failure['timestamp'] > cutoff:
+				age_minutes = int((time.time() - failure['timestamp']) / 60)
+				recent_failures.append({
+					'filename': failure['filename'],
+					'error': failure['error'],
+					'age_minutes': age_minutes
+				})
+		return recent_failures

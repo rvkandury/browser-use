@@ -181,7 +181,56 @@ class DownloadsWatchdog(BaseWatchdog):
 
 		# Define CDP event handlers outside of try to avoid indentation/scope issues
 		def download_will_begin_handler(event: DownloadWillBeginEvent, session_id: SessionID | None) -> None:
-			self.logger.debug(f'[DownloadsWatchdog] Download will begin: {event}')
+			self.logger.info(f'[DownloadsWatchdog] 🔽 Download will begin: {event}')
+			
+			# Use different download methods based on remote_downloads flag
+			download_url = event.get('url', '')
+			suggested_filename = event.get('suggestedFilename', os.path.basename(download_url) or 'downloaded_file')
+			self.logger.info(f'[DownloadsWatchdog] ✅ File download detected: {download_url}')
+			
+			# Choose download method based on remote_downloads flag
+			if self.browser_session.browser_profile.remote_downloads:
+				self.logger.info(f'[DownloadsWatchdog] 🌐 Using HTTP client download (remote_downloads=True)')
+				
+				# Track the download and start it in background
+				self.browser_session.add_active_download(download_url, suggested_filename)
+				asyncio.create_task(self.browser_session._download_via_http(download_url))
+				
+			else:
+				self.logger.info(f'[DownloadsWatchdog] 🔧 Using JavaScript fetch download (remote_downloads=False)')
+				
+				# Track the download
+				self.browser_session.add_active_download(download_url, suggested_filename)
+				
+				# Create async task to call our JavaScript fetch method
+				async def download_file():
+					try:
+						result = await self.trigger_file_download(target_id, download_url, suggested_filename)
+						if result:  # Only if successful
+							filename = event.get('suggestedFilename', os.path.basename(download_url) or 'downloaded_file')
+							self.event_bus.dispatch(
+								FileDownloadedEvent(
+									url=download_url,
+									path=result,
+									file_name=filename,
+									file_size=os.path.getsize(result) if os.path.exists(result) else 0,
+									file_type=os.path.splitext(filename)[1].lstrip('.') or 'unknown',
+									mime_type='application/octet-stream',  # Generic MIME type
+									auto_download=True,
+									from_cache=False
+								)
+							)
+							self.logger.info(f'[DownloadsWatchdog] ✅ Emitted success event for {filename}')
+						else:
+							# Track failed download
+							self.browser_session.add_failed_download(download_url, suggested_filename, "JavaScript fetch failed")
+							self.logger.warning(f'[DownloadsWatchdog] ❌ Download failed, no event emitted')
+					finally:
+						# Always cleanup active download tracking
+						self.browser_session.remove_active_download(download_url)
+				
+				asyncio.create_task(download_file())
+			
 			# Cache info for later completion event handling (esp. remote browsers)
 			guid = event.get('guid', '')
 			try:
@@ -999,13 +1048,21 @@ class DownloadsWatchdog(BaseWatchdog):
 				self.logger.debug(f'[DownloadsWatchdog] PDF detected via URL pattern: {page_url}')
 				self._pdf_viewer_cache[page_url] = True
 				return True
+			
+			# Check for CSV files
+			url_is_csv = self._check_url_for_csv(page_url)
+			if url_is_csv:
+				self.logger.info(f'[DownloadsWatchdog] ✅ CSV detected via URL pattern: {page_url}')
+				self._pdf_viewer_cache[page_url] = True  # Reuse cache for now
+				return True
+				
 			chrome_pdf_viewer = self._is_chrome_pdf_viewer_url(page_url)
 			if chrome_pdf_viewer:
 				self.logger.debug(f'[DownloadsWatchdog] Chrome PDF viewer detected: {page_url}')
 				self._pdf_viewer_cache[page_url] = True
 				return True
 
-			# Not a PDF
+			# Not a PDF or CSV
 			self._pdf_viewer_cache[page_url] = False
 			return False
 
@@ -1037,6 +1094,35 @@ class DownloadsWatchdog(BaseWatchdog):
 				'content-type=application%2fpdf',
 				'mimetype=application/pdf',
 				'type=application/pdf',
+			]
+		):
+			return True
+
+		return False
+
+	def _check_url_for_csv(self, url: str) -> bool:
+		"""Check if URL indicates a CSV file."""
+		if not url:
+			return False
+
+		url_lower = url.lower()
+
+		# Direct CSV file extensions
+		if url_lower.endswith('.csv'):
+			return True
+
+		# CSV in path
+		if '.csv' in url_lower:
+			return True
+
+		# CSV MIME type in URL parameters
+		if any(
+			param in url_lower
+			for param in [
+				'content-type=text/csv',
+				'content-type=text%2fcsv',
+				'mimetype=text/csv',
+				'type=text/csv',
 			]
 		):
 			return True
@@ -1092,6 +1178,82 @@ class DownloadsWatchdog(BaseWatchdog):
 		except Exception as e:
 			self.logger.debug(f'[DownloadsWatchdog] Network headers check failed (non-critical): {e}')
 			return False
+
+	async def trigger_file_download(self, target_id: TargetID, file_url: str, suggested_filename: str | None = None) -> str | None:
+		"""Trigger download of any file using JavaScript fetch with provided URL."""
+		self.logger.info(f'[DownloadsWatchdog] 📥 Starting file download: {file_url}')
+		
+		if not self.browser_session.browser_profile.downloads_path:
+			self.logger.warning('[DownloadsWatchdog] ❌ No downloads path configured')
+			return None
+
+		try:
+			self.logger.info(f'[DownloadsWatchdog] Creating CDP session for file download')
+			temp_session = await self.browser_session.get_or_create_cdp_session(target_id, focus=False)
+			self.logger.info(f'[DownloadsWatchdog] CDP session created successfully')
+			
+			escaped_url = json.dumps(file_url)
+			self.logger.info(f'[DownloadsWatchdog] Starting JavaScript fetch...')
+
+			result = await asyncio.wait_for(
+				temp_session.cdp_client.send.Runtime.evaluate(
+					params={
+						'expression': f"""
+					(async () => {{
+						try {{
+							const response = await fetch({escaped_url});
+							if (!response.ok) {{
+								return {{ error: `HTTP error! status: ${{response.status}}` }};
+							}}
+							const blob = await response.blob();
+							const arrayBuffer = await blob.arrayBuffer();
+							const uint8Array = new Uint8Array(arrayBuffer);
+							
+							return {{ 
+								data: Array.from(uint8Array),
+								responseSize: uint8Array.length
+							}};
+						}} catch (error) {{
+							return {{ error: `Fetch failed: ${{error.message}}` }};
+						}}
+					}})()
+					""",
+						'awaitPromise': True,
+						'returnByValue': True,
+					},
+					session_id=temp_session.session_id,
+				),
+				timeout=60.0  # 30 second timeout for large files
+			)
+			
+			self.logger.info(f'[DownloadsWatchdog] JavaScript fetch completed')
+			download_result = result.get('result', {}).get('value', {})
+			
+			if download_result.get('error'):
+				self.logger.error(f'[DownloadsWatchdog] File fetch error: {download_result["error"]}')
+				return None
+
+			if download_result and download_result.get('data') and len(download_result['data']) > 0:
+				# Use suggested filename if provided, otherwise extract from URL
+				filename = suggested_filename or os.path.basename(file_url.split('?')[0]) or 'downloaded_file'
+				downloads_dir = str(self.browser_session.browser_profile.downloads_path)
+				os.makedirs(downloads_dir, exist_ok=True)
+				download_path = os.path.join(downloads_dir, filename)
+
+				async with await anyio.open_file(download_path, 'wb') as f:
+					await f.write(bytes(download_result['data']))
+
+				if os.path.exists(download_path):
+					actual_size = os.path.getsize(download_path)
+					self.logger.info(f'[DownloadsWatchdog] ✅ File downloaded: {download_path} ({actual_size} bytes)')
+					return download_path
+
+			self.logger.warning(f'[DownloadsWatchdog] No file data received')
+			return None
+
+		except Exception as e:
+			self.logger.error(f'[DownloadsWatchdog] ❌ File download failed: {e}')
+			return None
 
 	async def trigger_pdf_download(self, target_id: TargetID) -> str | None:
 		"""Trigger download of a PDF from Chrome's PDF viewer.
