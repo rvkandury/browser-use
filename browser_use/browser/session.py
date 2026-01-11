@@ -3622,49 +3622,35 @@ class BrowserSession(BaseModel):
 			# Track the failed download
 			filename = url.split('/')[-1].split('?')[0] or 'download.dat'
 			self.add_failed_download(url, filename, str(e))
-			
-			# Remove from active downloads
-			self.remove_active_download(url)
 
 	def get_active_downloads(self) -> list[dict]:
-		"""Get list of currently active downloads, cleaning up old ones."""
+		"""Get list of currently active downloads."""
+		return [self._format_download_info(url, info) 
+		        for url, info in self._active_downloads.items()]
+
+	def _format_download_info(self, url: str, info: dict) -> dict:
+		"""Format single download with progress info."""
 		import time
-		current_time = time.time()
+		download_info = {
+			'url': url,
+			'filename': info['filename'],
+			'duration': int(time.time() - info['start_time'])
+		}
 		
-		# Clean up downloads older than 10 minutes (assume failed)
-		expired_urls = [
-			url for url, info in self._active_downloads.items() 
-			if current_time - info['start_time'] > 600  # 10 minutes
-		]
-		for url in expired_urls:
-			filename = self._active_downloads[url]['filename']
-			self._active_downloads.pop(url, None)
-			self.logger.info(f"⏰ Cleaned up 1 expired download: {filename} (total: {len(self._active_downloads)} active downloads)")
+		# Add progress information if available
+		if 'downloaded' in info and 'total_size' in info:
+			downloaded = info['downloaded']
+			total_size = info['total_size']
+			if total_size > 0:
+				progress_percent = int((downloaded / total_size) * 100)
+				downloaded_mb = downloaded / (1024 * 1024)
+				total_mb = total_size / (1024 * 1024)
+				download_info['progress'] = f"{downloaded_mb:.1f}MB / {total_mb:.1f}MB ({progress_percent}%)"
+			else:
+				downloaded_mb = downloaded / (1024 * 1024)
+				download_info['progress'] = f"{downloaded_mb:.1f}MB"
 		
-		# Return remaining active downloads with progress
-		active = []
-		for url, info in self._active_downloads.items():
-			download_info = {
-				'url': url,
-				'filename': info['filename'],
-				'duration': int(current_time - info['start_time'])
-			}
-			
-			# Add progress information if available
-			if 'downloaded' in info and 'total_size' in info:
-				downloaded = info['downloaded']
-				total_size = info['total_size']
-				if total_size > 0:
-					progress_percent = int((downloaded / total_size) * 100)
-					downloaded_mb = downloaded / (1024 * 1024)
-					total_mb = total_size / (1024 * 1024)
-					download_info['progress'] = f"{downloaded_mb:.1f}MB / {total_mb:.1f}MB ({progress_percent}%)"
-				else:
-					downloaded_mb = downloaded / (1024 * 1024)
-					download_info['progress'] = f"{downloaded_mb:.1f}MB"
-			
-			active.append(download_info)
-		return active
+		return download_info
 
 	def add_active_download(self, url: str, filename: str):
 		"""Track a new active download."""
@@ -3695,16 +3681,11 @@ class BrowserSession(BaseModel):
 		self.logger.error(f"❌ Download failed: {filename} - {error}")
 
 	def get_failed_downloads(self) -> list[dict]:
-		"""Get list of recent failed downloads (last 5 minutes)."""
+		"""Get all failed downloads with age info for LLM context."""
 		import time
-		cutoff = time.time() - 300  # 5 minutes
-		recent_failures = []
-		for failure in self._failed_downloads:
-			if failure['timestamp'] > cutoff:
-				age_minutes = int((time.time() - failure['timestamp']) / 60)
-				recent_failures.append({
-					'filename': failure['filename'],
-					'error': failure['error'],
-					'age_minutes': age_minutes
-				})
-		return recent_failures
+		current_time = time.time()
+		return [{
+			'filename': failure['filename'],
+			'error': failure['error'],
+			'age_minutes': int((current_time - failure['timestamp']) / 60)
+		} for failure in self._failed_downloads]

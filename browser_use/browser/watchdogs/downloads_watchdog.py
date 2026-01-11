@@ -192,19 +192,24 @@ class DownloadsWatchdog(BaseWatchdog):
 			if self.browser_session.browser_profile.remote_downloads:
 				self.logger.info(f'[DownloadsWatchdog] 🌐 Using HTTP client download (remote_downloads=True)')
 				
-				# Track the download and start it in background
-				self.browser_session.add_active_download(download_url, suggested_filename)
-				asyncio.create_task(self.browser_session._download_via_http(download_url))
+				# Create async task with guaranteed cleanup
+				async def http_download():
+					try:
+						self.browser_session.add_active_download(download_url, suggested_filename)
+						await self.browser_session._download_via_http(download_url)
+					finally:
+						# Always cleanup active download tracking
+						self.browser_session.remove_active_download(download_url)
+				
+				asyncio.create_task(http_download())
 				
 			else:
 				self.logger.info(f'[DownloadsWatchdog] 🔧 Using JavaScript fetch download (remote_downloads=False)')
 				
-				# Track the download
-				self.browser_session.add_active_download(download_url, suggested_filename)
-				
 				# Create async task to call our JavaScript fetch method
 				async def download_file():
 					try:
+						self.browser_session.add_active_download(download_url, suggested_filename)
 						result = await self.trigger_file_download(target_id, download_url, suggested_filename)
 						if result:  # Only if successful
 							filename = event.get('suggestedFilename', os.path.basename(download_url) or 'downloaded_file')
