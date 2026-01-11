@@ -784,6 +784,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			page_filtered_actions=page_filtered_actions if page_filtered_actions else None,
 			sensitive_data=self.sensitive_data,
 			available_file_paths=self.available_file_paths,  # Always pass current available_file_paths
+			active_downloads=self.browser_session.active_downloads if self.browser_session else None,
+			failed_downloads=self.browser_session.failed_downloads if self.browser_session else None,
 		)
 
 		await self._force_done_after_last_step(step_info)

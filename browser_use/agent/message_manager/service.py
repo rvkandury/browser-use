@@ -298,6 +298,8 @@ class MessageManager:
 		page_filtered_actions: str | None = None,
 		sensitive_data=None,
 		available_file_paths: list[str] | None = None,  # Always pass current available_file_paths
+		active_downloads: list[dict] | None = None,
+		failed_downloads: list[dict] | None = None,
 	) -> None:
 		"""Create single state message with all content"""
 
@@ -358,6 +360,8 @@ class MessageManager:
 			page_filtered_actions=page_filtered_actions,
 			sensitive_data=self.sensitive_data_description,
 			available_file_paths=available_file_paths,
+			active_downloads=active_downloads,
+			failed_downloads=failed_downloads,
 			screenshots=screenshots,
 			vision_detail_level=self.vision_detail_level,
 			include_recent_events=self.include_recent_events,
